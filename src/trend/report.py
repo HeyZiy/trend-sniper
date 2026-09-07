@@ -14,8 +14,10 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.market_state.market_gate import RegimeDiagnosis
+from src.trend.entry_tier import (
+    MIN_STOP_LOSS_PCT, position_size, resolve_tier, tier_rule,
+)
 from src.trend.removal_rules import REMOVAL_RULES, RemovalStats
-from src.trend.sell_rules import HoldingRow
 from src.trend.signal_detector import UNKNOWN_SECTOR, TechnicalSignal
 from src.trend.veto_rules import ACTION_REMOVE
 
@@ -75,9 +77,6 @@ _RANK_HEADER = (
 _PLAN_ROW = "| {rank} | {stock} | {sector} | {score} | {confirm} | {sizing} |"
 _PLAN_HEADER = ("排名", "股票", "板块", "评分→有效分", "介入条件", "仓位")
 
-_SELL_ROW = "| {stock} | {action} | {price} | {cost} | {profit} | {vol} | {rules} | {shares} |"
-_SELL_HEADER = ("股票", "建议", "现价", "成本", "盈亏", "量比", "触发规则", "卖出股数")
-
 # 各信号类型分表的区头与说明（与 KNOWN_SIGNAL_TYPES 对应；新增类型必须在此登记，否则 KeyError）
 _SECTION_TITLES = {
     'pullback_ma5': (
@@ -93,9 +92,6 @@ _SECTION_TITLES = {
         "> 同一组 setup，但当日收涨未回踩：不追高，进观察池等回踩MA5企稳再接。",
     ),
 }
-
-_HOLD_ROW = "| {stock} | {price} | {cost} | {profit} | {sector} |"
-_HOLD_HEADER = ("股票", "现价", "成本", "盈亏", "板块")
 
 _PAIR_ROW = "| {stock} | {reason} |"
 _PAIR_HEADER = ("股票", "原因")
@@ -245,14 +241,7 @@ def _build_action_guide(s: TechnicalSignal) -> dict:
         guide['invalidation'] = f"次日收盘跌破MA10({_f(s.ma10)}) 或继续缩量阴跌"
         guide['sizing'] = "半仓(25%)或观望"
 
-    # 根据市场环境调节仓位
-    if s.regime_note:
-        if "下行" in s.regime_note:
-            guide['sizing'] = "轻仓(20%)或放弃"
-        elif "震荡" in s.regime_note:
-            guide['sizing'] = "正常仓位(50%)"
-
-    # 根据有效评分进一步调节（effective 未计算时会抛异常，不接受静默的 0 分）
+    # 根据有效评分调节（effective 未计算时会抛异常，不接受静默的 0 分）
     if s.effective >= 80:
         guide['confidence'] = "高"
         if "轻仓" not in guide['sizing']:
@@ -263,14 +252,39 @@ def _build_action_guide(s: TechnicalSignal) -> dict:
         guide['confidence'] = "低"
         guide['sizing'] = "观望或放弃"
 
-    # near_ma5 兜底封顶：评分类已封 79，这里防环境调节系数异常抬分后把它送进"尾盘介入"档
+    # near_ma5 兜底封顶：评分类已封 79，防止它进"尾盘介入"档（与"等回踩"剧本矛盾）
     if s.signal_type == 'near_ma5':
         if guide['confidence'] == "高":
             guide['confidence'] = "中"
         if "正常仓位" in guide['sizing']:
             guide['sizing'] = "轻仓(25%)或等回踩"
 
+    # 开仓档位 → 仓位上限。环境调整只落在仓位上，不乘评分系数：
+    # 系数会整体压低评分（弱的没筛掉、强的被拖进"暂不关注"），且无法归因。
+    rule = tier_rule(s.entry_tier)
+    if rule is None:
+        guide['confidence'] = "低"
+        guide['sizing'] = "禁止开仓（当前状态不启用开仓档位）"
+    else:
+        stop_pct = _stop_loss_pct(s)
+        cap = position_size(s.entry_tier, stop_pct)
+        guide['sizing'] = (
+            f"{guide['sizing']}｜{rule.label}上限{cap:.0f}元"
+            f"（亏损限额{rule.loss_budget:.0f}元÷止损{stop_pct:.1f}%）"
+        )
+
     return guide
+
+
+def _stop_loss_pct(s: TechnicalSignal) -> float:
+    """止损距离（%）：以 MA10 为止损参考（减仓后止损线移至 MA10，清仓亦以 MA10 为准）。
+
+    价格贴近或跌破 MA10 时距离趋近 0，取 MIN_STOP_LOSS_PCT 为下限——
+    否则「亏损限额 ÷ 止损距离」会算出天量仓位。
+    """
+    if s.current_price > 0 and s.ma10 > 0:
+        return max((s.current_price - s.ma10) / s.current_price * 100, MIN_STOP_LOSS_PCT)
+    return MIN_STOP_LOSS_PCT
 
 
 def _format_rank_table(signals: List[TechnicalSignal], signal_type: str) -> List[str]:
@@ -389,80 +403,24 @@ def _format_t1_plan(signals: List[TechnicalSignal]) -> List[str]:
     return lines
 
 
-def _format_sell_section(sell_rows: List[HoldingRow]) -> List[str]:
-    """生成持仓卖出信号板块。
+def _format_tier_block_section(blocked: List[Tuple[str, str, str]]) -> List[str]:
+    """生成开仓档位收紧拦截板块。
 
-    sell_rows: HoldingRow 列表（一只持仓一行）
+    被档位拦下的信号必须显式列出——否则用户只看到"今日无信号"，
+    无法区分"没触发买点"与"触发了但被环境的收紧规则挡掉"。
     """
     lines = [
-        "## 🚨 持仓卖出信号",
+        "## 🔒 档位收紧拦截",
         "",
-        "> 持仓事实来源：妙想模拟仓（每日盘后读取）。信号只出建议，执行由用户主动。",
+        "> 已触发买点但不满足当前档位的收紧条件（位置 / 资金），不进信号池。",
         "",
     ]
-
-    if not sell_rows:
-        lines.append("当前无股票持仓（ETF 持仓由 ETF 系统管理，不在此列）。")
-        lines.append("")
-        return lines
-
-    # 板块不可用 → 板块类规则判不了。必须显式标注，
-    # 否则用户会把"无卖出信号"读成"板块没走弱"，而实际是根本没判。
-    skipped = [r for r in sell_rows if r.sector_skipped]
-    if skipped:
-        shown = "、".join(f"{r.name}({r.code})" for r in skipped[:10])
-        if len(skipped) > 10:
-            shown += " 等"
-        lines.extend([
-            f"> ⚠️ {len(skipped)} 只持仓板块信息不可用（{shown}）—— "
-            "**板块类卖出规则（板块走弱 / 主线退潮）已跳过**，"
-            "这些标的的「无卖出信号」不代表板块没走弱。",
-            "",
-        ])
-
-    with_signal = [r for r in sell_rows if r.signal is not None]
-    if with_signal:
-        lines.extend(_header(_SELL_HEADER, _SELL_ROW))
-        for row in with_signal:
-            sig = row.signal
-            action = "🔴 清仓" if sig.action == "clear" else "🟠 减仓50%"
-            rules = "；".join(sig.reasons)
-            if sig.note:
-                rules += f"（{sig.note}）"
-            lines.append(_row(
-                _SELL_ROW,
-                stock=f"{sig.name}({sig.code})",
-                action=action,
-                price=_f(sig.current_price),
-                cost=_f(sig.cost_price),
-                profit=_f_pct(sig.profit_pct),
-                vol=_f(sig.vol_ratio),
-                rules=rules,
-                shares=f"{sig.suggest_shares}股",
-            ))
-        lines.append("")
-
-    holds = [r for r in sell_rows if r.signal is None]
-    if holds:
-        lines.extend([
-            "**无卖出信号持仓（继续持有观察）**",
-            "",
-        ])
-        lines.extend(_header(_HOLD_HEADER, _HOLD_ROW))
-        for row in holds:
-            sector_label = _sector_label(row.sector, rules_skipped=row.sector_skipped)
-            if row.sector_pct is not None:
-                sector_label += f"（当日{_f_pct(row.sector_pct)}）"
-            lines.append(_row(
-                _HOLD_ROW,
-                stock=f"{row.name}({row.code})",
-                price=_f(row.position.get('current_price', 0) or 0),
-                cost=_f(row.position.get('cost_price', 0) or 0),
-                profit=_f_pct(row.profit_pct),
-                sector=sector_label,
-            ))
-        lines.append("")
-
+    lines.extend(_header(_PAIR_HEADER, _PAIR_ROW))
+    for code, name, reason in blocked[:20]:
+        lines.append(_row(_PAIR_ROW, stock=f"{name}({code})", reason=reason))
+    if len(blocked) > 20:
+        lines.append(_row(_PAIR_ROW, stock="...", reason=f"等共{len(blocked)}只股票"))
+    lines.extend(["", "---", ""])
     return lines
 
 
@@ -611,11 +569,11 @@ def generate_technical_report(
     removed_stocks = None,
     market_env: Optional[Tuple] = None,
     failed_stocks = None,
-    sell_rows = None,
     vetoed_stocks = None,
     detail_level: str = "standard",
     removal_stats: Optional['RemovalStats'] = None,
     regime_diag: Optional['RegimeDiagnosis'] = None,
+    tier_blocked = None,
 ) -> str:
     """
     生成 Markdown 格式的趋势跟踪日报。
@@ -624,19 +582,20 @@ def generate_technical_report(
     或传入字段与占位符不匹配，都会抛 ValueError 而不是产出静默错位的表格。
 
     报告结构（自上而下 = 决策优先级）：
-        头条结论 → 市场环境（含状态判定明细）→ 持仓卖出 → 剔除规则覆盖
+        头条结论 → 市场环境（含状态判定明细）→ 剔除规则覆盖
         → 剔除名单 → 负面清单 → 分析失败 → 信号明细 → T+1 操作计划
+
 
     Args:
         signals: TechnicalSignal 列表（须已 apply_regime，否则 effective 抛异常）
         removed_stocks: (code, name, reason) 元组列表
         market_env: (can_trade, conditions, summary, regime) 或 None
         failed_stocks: (code, name, reason) 元组列表
-        sell_rows: HoldingRow 列表（卖出行，一持仓一行）
         vetoed_stocks: (code, name, action, reason) 元组列表，action 见 veto_rules
         detail_level: "compact"（通知精简）| "standard"（文件标准）| "full"（完整含操作计划）
         removal_stats: 剔除规则逐条统计（RemovalStats）
         regime_diag: 市场状态判定明细（RegimeDiagnosis）
+        tier_blocked: (code, name, reason) 元组列表，被开仓档位收紧规则拦下的候选
 
     Returns:
         格式化的 Markdown 字符串
@@ -644,6 +603,7 @@ def generate_technical_report(
     removed_stocks = removed_stocks or []
     failed_stocks = failed_stocks or []
     vetoed_stocks = vetoed_stocks or []
+    tier_blocked = tier_blocked or []
     today_str = datetime.now().strftime('%Y-%m-%d')
 
     # ── 头条：先给结论（发现 N 个 / 达标 M 个 / 能不能动手）──
@@ -678,29 +638,30 @@ def generate_technical_report(
             icon = "✅" if met_val else ("❌" if met_val is not None else "⟖")
             lines.append(f"- {icon} {cond_name}")
 
-        # 市场环境对信号的影响提示
-        regime_modifier = {
-            "trending_up": "1.0", "weak_up": "0.85",
-            "sideways": "0.8", "trending_down": "0.5",
-            "chaos": "0.0",
-        }.get(regime, "0.85")
-        regime_label = {
-            "trending_up": "上行", "weak_up": "弱上行",
-            "sideways": "震荡", "trending_down": "下行",
-            "chaos": "混沌",
-        }.get(regime, "不明")
-        lines.extend([
-            "",
-            f"> 📌 当前 **{regime_label}** 环境下，技术评分已乘以 **×{regime_modifier}** 系数调整为有效评分。",
-            "",
-            "---",
-            "",
-        ])
+        # 当前环境启用的开仓档位（环境调整落到具体规则，不再乘评分系数）
+        rule = tier_rule(resolve_tier(regime))
+        if rule is None:
+            lines.extend([
+                "",
+                f"> 📌 当前状态**不启用开仓档位**：禁止开新仓（有效评分 = 技术评分，信号仅作观察）。",
+                "",
+                "---",
+                "",
+            ])
+        else:
+            lines.extend([
+                "",
+                f"> 📌 当前启用 **{rule.label}** 开仓规则：{rule.describe()}。",
+                "",
+                "> 仓位上限 = 亏损限额 ÷ 止损距离（止损参考 MA10）。环境只收紧规则与仓位，不乘评分系数。",
+                "",
+                "---",
+                "",
+            ])
 
-    # 持仓卖出信号
-    if sell_rows is not None:
-        lines.extend(_format_sell_section(sell_rows))
-        lines.extend(["---", ""])
+        # 档位收紧拦截（有则展示，说明"信号没进池"是规则生效而非没跑）
+        if tier_blocked:
+            lines.extend(_format_tier_block_section(tier_blocked))
 
     # 剔除规则覆盖情况：逐条「检查 N 只 / 触发 N 只」，未实现项显式标注
     lines.extend(_format_removal_stats_section(removal_stats))

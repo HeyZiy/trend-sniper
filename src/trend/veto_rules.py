@@ -367,6 +367,36 @@ def _check_announcement_veto(code: str, name: str, mx_service: Any) -> Optional[
     return None
 
 
+def fetch_main_net_inflow(code: str, name: str, mx_service: Any,
+                          days: int = FUND_FLOW_DAYS) -> Optional[float]:
+    """近 N 日主力资金净流入合计（元）。
+
+    供 V5（净流出否决）与开仓档位「收紧档资金确认」共用——两者口径必须一致，
+    否则会出现"V5 判为流出、档位判为流入"的自相矛盾。
+
+    Returns:
+        净流入合计（元，负数=净流出）；取不到或解析失败返回 None（fail-open）
+    """
+    if mx_service is None:
+        return None
+
+    tag = f"{name}({code})"
+    try:
+        resp = mx_service.query_financial_data(f"{name}({code}) 近{days}个交易日 每日主力净流入")
+        column_name, values = _extract_series(resp, keywords=("主力", "净流入"))
+    except Exception as e:
+        logger.warning(f"  {tag}: 主力资金查询失败，返回 None（{e}）")
+        return None
+
+    if not values:
+        logger.warning(f"  {tag}: 未取到主力净流入序列，返回 None")
+        return None
+
+    recent = values[-days:]
+    recent = [_to_yuan(v, column_name) for v in recent]
+    return sum(recent)
+
+
 def _check_fund_flow_veto(code: str, name: str, mx_service: Any, fetcher: Any) -> Optional[str]:
     """V5：近 5 日主力资金净流出 > 流通市值 1% → 返回触发原因，否则 None。"""
     if mx_service is None or fetcher is None:
@@ -374,20 +404,10 @@ def _check_fund_flow_veto(code: str, name: str, mx_service: Any, fetcher: Any) -
 
     tag = f"{name}({code})"
 
-    try:
-        resp = mx_service.query_financial_data(f"{name}({code}) 近5个交易日 每日主力净流入")
-        column_name, values = _extract_series(resp, keywords=("主力", "净流入"))
-    except Exception as e:
-        logger.warning(f"  {tag}: V5 主力资金查询失败，放行（{e}）")
+    net_flow = fetch_main_net_inflow(code, name, mx_service, days=FUND_FLOW_DAYS)
+    if net_flow is None:
+        logger.warning(f"  {tag}: V5 主力资金数据缺失，放行")
         return None
-
-    if not values:
-        logger.warning(f"  {tag}: V5 未取到主力净流入序列，放行")
-        return None
-
-    recent = values[-FUND_FLOW_DAYS:]
-    recent = [_to_yuan(v, column_name) for v in recent]
-    net_flow = sum(recent)
     if net_flow >= 0:
         return None
 

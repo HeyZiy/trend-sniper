@@ -20,9 +20,14 @@
 
 trending_down 收紧版：MA10 破位 1 天 / 回撤≥3% / 量比≥1.5 / 板块走弱阈值 -1%。
 硬拦截：全部清仓。
-sideways/chaos：自然退出，不输出主动卖出信号（仅硬拦截全清）。
+sideways/chaos：用**正常版**并照常输出卖出信号——「自然退出」指不收紧阈值，
+不是不执行，正常版的清仓规则在 sideways/chaos 下照常生效。
 
-持仓事实来源：妙想模拟仓（用户手动同步持仓）；执行仍由用户主动，本模块只出建议。
+持仓事实来源：妙想模拟仓（用户手动同步持仓）。
+
+执行方式：由尾盘任务 trend_sell.py 在每交易日 14:45 后读取本模块信号，
+自动下模拟仓市价单（reduce_half / clear / 硬拦截全清 全部自动执行）。
+本模块只负责判定，不碰下单；下单与股数收敛见 trend_sell.py:execute_sell()。
 
 量比口径：当日成交量 ÷ 前 5 日均量（不含当日）。
 
@@ -220,9 +225,7 @@ def _check_rules(metrics: dict, profit_pct: float, regime: str,
     if hard_intercept:
         return "clear", ["市场门控硬拦截，全部清仓"], ""
 
-    if regime in ("sideways", "chaos"):
-        return "", [], ""  # 自然退出，不主动砍仓
-
+    # 只有 trending_down 收紧；sideways/weak_up/chaos 一律走正常版并照常输出信号
     tight = regime == "trending_down"
     vol_thr = VOL_RATIO_TIGHT if tight else VOL_RATIO_NORMAL
     dd_thr = DRAWDOWN_TIGHT if tight else DRAWDOWN_NORMAL
@@ -324,7 +327,8 @@ def detect_sell_signals(code: str, name: str, df: pd.DataFrame, position: dict,
         entry_date: 买入日期（历史委托推导，可为空）
 
     Returns:
-        SellSignal 或 None（无信号）
+        SellSignal 或 None（无信号）。suggest_shares 已按可卖量收敛并取整到 100 整数倍，
+        可能因可用不足而为 0（调用方按不足一手处理，不直接下单）。
     """
     metrics = _compute_metrics(df)
     if metrics is None:
@@ -341,6 +345,11 @@ def detect_sell_signals(code: str, name: str, df: pd.DataFrame, position: dict,
         suggest = half if half >= 100 else count  # 不足一手半仓时建议直接清仓
     else:
         suggest = count
+
+    # 收敛到可卖量：avail_count 可能小于总持仓（T+1 或已挂单），缺省回退总持仓。
+    # 并向下取整到 100 整数倍 —— 妙想对非整手委托直接拒单。
+    avail = int(position.get("avail_count", 0) or 0) or count
+    suggest = (min(suggest, avail) // 100) * 100
 
     return SellSignal(
         code=code,

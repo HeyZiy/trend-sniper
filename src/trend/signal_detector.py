@@ -47,8 +47,11 @@ class TechnicalSignal:
 
     Attributes:
         sector: 所属板块名称，取不到时为 UNKNOWN_SECTOR
-        effective_score: 经市场环境调节后的有效评分（None = 未调节）
-        regime_note: 环境调节说明（如"趋势下行×0.5"）
+        position_gain: 本轮起点涨幅（%），距近 60 日最低收盘的涨幅（与 veto V7 同口径）。
+            开仓档位收紧（基础/半收紧/收紧）的判定输入，见 src/trend/entry_tier.py
+        entry_tier: 市场状态对应的开仓档位（None = 不启用档位，禁止开仓）
+        effective_score: 经市场环境档位登记后的有效评分（None = 未登记）
+        regime_note: 档位说明（如"收紧档"）
     """
 
     # ── 必填（漏传即 TypeError）──
@@ -68,14 +71,19 @@ class TechnicalSignal:
 
     # ── 可选（有默认值）──
     sector: str = UNKNOWN_SECTOR  # 所属板块名称
-    effective_score: Optional[int] = None  # 经市场环境调节后的有效评分
-    regime_note: str = ""  # 环境调节说明
+    position_gain: float = 0.0  # 本轮起点涨幅（%），档位收紧判定用
+    entry_tier: Optional[str] = None  # 开仓档位（None = 不启用档位）
+    effective_score: Optional[int] = None  # 登记档位后的有效评分
+    regime_note: str = ""  # 档位说明
+
+    # 允许为 None 的可选字段（其余字段 None 一律视为脏数据）
+    _NONE_ALLOWED = ("effective_score", "entry_tier")
 
     def __post_init__(self) -> None:
         """构造即校验：禁止 None、校验取值域，把错误挡在渲染层之前。"""
         for f in fields(self):
             value = getattr(self, f.name)
-            if value is None and f.name != "effective_score":
+            if value is None and f.name not in self._NONE_ALLOWED:
                 raise SignalFieldError(
                     f"{self.code or '?'}: 字段 {f.name} 为 None（禁止 None 流入渲染层）"
                 )
@@ -94,10 +102,19 @@ class TechnicalSignal:
             if value <= 0:
                 raise SignalFieldError(f"{self.name}({self.code}): {fname}={value} 非正数")
 
-    def apply_regime(self, modifier: float, note: str) -> None:
-        """按市场环境系数写入有效评分（渲染前的最后一步，必须且只需调用一次）。"""
-        self.effective_score = max(0, int(self.score * modifier))
+    def apply_regime(self, tier: Optional[str], note: str = "") -> None:
+        """登记市场状态对应的开仓档位，写入有效评分（渲染前必须且只需调用一次）。
+
+        2026-09 改版：删除「市场状态 → 评分系数」（×1.0/×0.85/×0.8/×0.5），
+        有效评分 = 技术评分。系数会把整批信号一起压低，弱的没筛掉、强的被拖进
+        "暂不关注"，且"降分"与"收紧选股"混在一起，事后无法归因。
+        环境的影响改为落到具体规则：
+        - 选股收紧（位置/资金）→ 由 entry_tier.screen_by_tier 过滤；
+        - 仓位限制（亏损限额 ÷ 止损距离）→ 由报告层按档位计算。
+        """
+        self.entry_tier = tier
         self.regime_note = note
+        self.effective_score = self.score
 
     @property
     def effective(self) -> int:
@@ -474,7 +491,8 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
             volume_ratio=volume_ratio,
             turnover_rate=turnover,
             pct_change=pct_change,
-            description=signal_desc
+            description=signal_desc,
+            position_gain=position_gain,
         ))
 
     # 信号2: 缩量回踩 MA10（次优买点 — 回踩较深，需确认支撑）
@@ -512,7 +530,8 @@ def detect_pullback_signals(code: str, name: str, df: pd.DataFrame) -> List[Tech
             volume_ratio=volume_ratio,
             turnover_rate=turnover,
             pct_change=pct_change,
-            description=f"回踩MA10（回踩较深），缩量（量比{volume_ratio:.2f}），涨跌{pct_change:+.2f}%，需次日弱转强确认"
+            description=f"回踩MA10（回踩较深），缩量（量比{volume_ratio:.2f}），涨跌{pct_change:+.2f}%，需次日弱转强确认",
+            position_gain=position_gain,
         ))
 
     else:

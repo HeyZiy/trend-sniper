@@ -43,6 +43,11 @@ REGIME_PATHS = {
 
 SIDEWAYS_BIAS = 0.015  # sideways 判定阈值：收盘偏离 MA20 < 1.5%
 
+# 可开仓的市场状态（对应 strategy/trend_strategy.md「市场状态分级与响应动作」）：
+# trending_up/weak_up/sideways 分别启用基础/半收紧/收紧档开仓规则（见 src/trend/entry_tier.py）；
+# trending_down（均线空头）与 chaos（方向不明）不启用档位，无论门控通过几项都禁止开新仓。
+REGIME_CAN_OPEN = ("trending_up", "weak_up", "sideways")
+
 
 def _n(value: Optional[float]) -> Optional[float]:
     """float 统一 2 位小数（报告口径，避免各处精度不一）。"""
@@ -398,6 +403,11 @@ def check_market_gate(gate_inputs: Dict[str, Any]) -> Tuple[bool, Dict[str, bool
         # 趋势策略坚持"底部偏右进场"，等收盘重回 MA20（weak_up/trending_up）再参与。
         can_trade = False
         details.append("📉 均线空头排列，无论门控通过多少项均禁止开仓（等收盘重回MA20）")
+    elif regime not in REGIME_CAN_OPEN:
+        # chaos（方向不明，多为收盘在 MA20 下方但尚未形成空头排列）：
+        # 不启用开仓档位，禁止开新仓；持仓卖出照常按正常版输出。
+        can_trade = False
+        details.append(f"🌪️ 状态{regime}：不启用开仓档位，禁止开新仓（等方向明确）")
     else:
         can_trade = met_count >= 2
 

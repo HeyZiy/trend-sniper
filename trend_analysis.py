@@ -21,7 +21,6 @@
 核心策略：
 - 买点：主升中的缩量回踩MA5（不破5日线 + 换手率>5%）
 - 不做：加速追高、情绪高潮接力、连续大阳后追涨
-- 卖出：每日读取妙想模拟仓持仓，输出卖出信号（减仓50%/清仓，见 sell_rules）
 - 环境过滤：见 strategy/market.md
 - 趋势不走坏即保留，连续2天跌破10日线才剔除
 
@@ -46,20 +45,20 @@ from src.indicators import add_standard_indicators
 from src.config import setup_env
 from src.notify.service import NotificationService
 from src.mx.service import MXService
-from src.mx.client import MXMoniClient
 from src.mx.position_utils import filter_stock_positions, get_last_buy_dates_safe
+from src.mx.client import MXMoniClient
 from src.market_state.market_gate import (
     check_market_gate, diagnose_regime, fetch_gate_inputs,
 )
 from src.trend.analyzer import StockTrendAnalyzer
+from src.trend.entry_tier import (
+    TIER_TIGHT, resolve_tier, screen_by_tier, tier_rule,
+)
 from src.trend.removal_rules import (
     RemovalStats, check_removal_rules, check_removal_rules_detail,
 )
 from src.trend.veto_rules import (
-    ACTION_REMOVE, check_external_veto, check_market_veto,
-)
-from src.trend.sell_rules import (
-    HoldingRow, detect_sell_signals, fetch_sector_pct_map, match_sector_pct,
+    ACTION_REMOVE, check_external_veto, check_market_veto, fetch_main_net_inflow,
 )
 from src.trend.signal_detector import (
     UNKNOWN_SECTOR, TechnicalSignal, detect_pullback_signals,
@@ -414,69 +413,25 @@ def _list_self_selected(analyzer: 'SimpleTechnicalAnalyzer') -> int:
         return 1
 
 
-def _analyze_holdings(analyzer: 'SimpleTechnicalAnalyzer', regime: str,
-                      hard_intercept: bool) -> List[HoldingRow]:
-    """读取妙想模拟仓股票持仓并检测卖出信号（只出建议，不执行交易）。
+def _fetch_held_codes() -> set:
+    """读取妙想模拟仓股票持仓代码集合，用于抑制「已持仓又提示买入」。
 
-    仅对股票持仓（代码前缀白名单）输出信号；ETF/基金/债券等非股票持仓
-    由 ETF 系统管理，不参与。卖出信号检测见 sell_rules。
+    只取代码，不做卖出检测（卖出由尾盘任务 trend_sell.py 负责）。
 
     Returns:
-        held_rows: 股票持仓行（一只一行，见 HoldingRow）
+        股票持仓代码集合（取不到时返回空集合，买入信号照常输出）
     """
     if not os.getenv("MX_APIKEY"):
-        logger.warning("未配置 MX_APIKEY，跳过持仓卖出分析")
-        return []
+        logger.warning("未配置 MX_APIKEY，跳过持仓读取（不抑制已持仓买入信号）")
+        return set()
 
-    client = MXMoniClient()
-    positions = filter_stock_positions(client.get_positions())
-    if not positions:
-        logger.info("妙想模拟仓当前无股票持仓")
-        return []
+    try:
+        positions = filter_stock_positions(MXMoniClient().get_positions())
+    except Exception as e:
+        logger.warning(f"读取妙想持仓失败: {e}（不抑制已持仓买入信号）")
+        return set()
 
-    entry_map = get_last_buy_dates_safe(client)
-    sector_pct_map = fetch_sector_pct_map()
-    if not sector_pct_map:
-        logger.warning("板块行情不可用，板块类卖出规则（板块走弱/主线退潮）跳过")
-
-    held_rows: List[HoldingRow] = []
-    for p in positions:
-        code = canonical_stock_code(p.get("code", ""))
-        name = p.get("name", "") or code
-        sector = analyzer._fetch_stock_sector(code)
-        sector_pct = match_sector_pct(sector, sector_pct_map)
-        # 板块未知 或 板块行情缺失 → 板块类规则判不了（不是"板块没走弱"），
-        # 需带到报告层显式标注，否则用户会把"无卖出信号"误读为安全。
-        sector_skipped = sector == UNKNOWN_SECTOR or sector_pct is None
-        if sector_skipped:
-            logger.warning(
-                f"⚠️ {name}({code}): 板块信息不可用（板块={sector}，"
-                f"板块行情={'有' if sector_pct is not None else '无'}）→ 板块类卖出规则已跳过"
-            )
-
-        sig = None
-        df = analyzer.fetch_stock_data(code)
-        if df is not None and len(df) >= 10:
-            df = df.sort_values('date').reset_index(drop=True)
-            df = analyzer.trend_analyzer._calculate_mas(df)
-            sig = detect_sell_signals(
-                code, name, df, p, regime, hard_intercept,
-                sector=sector, sector_pct=sector_pct,
-                entry_date=entry_map.get(code, ""),
-            )
-        held_rows.append(HoldingRow(
-            position=p, signal=sig, sector=sector,
-            sector_pct=sector_pct, sector_skipped=sector_skipped,
-        ))
-
-        if sig:
-            action_label = "🔴 清仓" if sig.action == "clear" else "🟠 减仓50%"
-            logger.info(f"{action_label} {name}({code}): {'；'.join(sig.reasons)}")
-        elif df is None:
-            logger.warning(f"    {name}({code}) 行情获取失败，无法检测卖出信号")
-        else:
-            logger.info(f"    {name}({code}) 持仓无卖出信号")
-    return held_rows
+    return {canonical_stock_code(p.get("code", "")) for p in positions}
 
 
 def _save_report(report: str) -> str:
@@ -600,34 +555,28 @@ def main():
         if hard_intercept:
             logger.warning("硬拦截触发！当日应清仓所有持仓，不执行任何买入操作")
 
-        # 根据市场环境调节信号有效评分
-        regime_modifiers = {
-            "trending_up": 1.0,
-            "weak_up": 0.85,
-            "sideways": 0.8,
-            "trending_down": 0.5,
-            "chaos": 0.0,
-        }
-        regime_modifier = regime_modifiers.get(market_regime, 0.85)
-        regime_labels = {
-            "trending_up": "趋势上行×1.0",
-            "weak_up": "弱上行×0.85",
-            "sideways": "震荡横盘×0.8",
-            "trending_down": "趋势下行×0.5",
-            "chaos": "混沌×不开仓",
-        }
-        regime_note = regime_labels.get(market_regime, "状态不明×0.85")
-        # 经 apply_regime 写入有效评分：漏跑这一步会在渲染层抛异常，
+        # 开仓规则档位：环境调整落到具体规则（档位收紧 + 亏损限额），不再乘评分系数
+        tier = resolve_tier(market_regime)
+        rule = tier_rule(tier)
+        tier_note = rule.label if rule else "不开仓（未启用档位）"
+        logger.info(f"开仓规则档位：{tier_note}" + (f"（{rule.describe()}）" if rule else ""))
+        # 经 apply_regime 登记档位：漏跑这一步会在渲染层抛异常，
         # 而不是让 effective_score 静默保持 0 把信号全判成"暂不关注"
         for s in signals:
-            s.apply_regime(regime_modifier, regime_note)
+            s.apply_regime(tier, tier_note)
 
-        # 4.5 持仓卖出信号（妙想持仓为事实来源，只出建议，执行由用户主动）
-        held_rows = _analyze_holdings(analyzer, market_regime, hard_intercept)
+        # 档位收紧过滤：位置（本地）+ 资金确认（收紧档，惰性外部取数）
+        def _net_inflow(code: str, name: str):
+            return fetch_main_net_inflow(code, name, analyzer.mx_service)
 
-        # 已持仓股票抑制买入信号（避免"持有又提示买入"）
-        if held_rows:
-            held_codes = {canonical_stock_code(r.code) for r in held_rows}
+        signals, tier_blocked = screen_by_tier(
+            signals, tier,
+            net_inflow_fn=_net_inflow if tier == TIER_TIGHT else None,
+        )
+
+        # 4.5 已持仓股票抑制买入信号（避免"持有又提示买入"）
+        held_codes = _fetch_held_codes()
+        if held_codes:
             filtered = [s for s in signals if canonical_stock_code(s.code) not in held_codes]
             if len(filtered) != len(signals):
                 logger.info(f"抑制 {len(signals) - len(filtered)} 只持仓股票的买入信号")
@@ -637,9 +586,9 @@ def main():
                                            market_env=(can_trade, market_conditions, market_summary, market_regime),
                                            failed_stocks=failed_stocks,
                                            vetoed_stocks=vetoed_stocks,
-                                           sell_rows=held_rows,
                                            removal_stats=removal_stats,
-                                           regime_diag=regime_diag)
+                                           regime_diag=regime_diag,
+                                           tier_blocked=tier_blocked)
 
         # 5. 保存报告
         _save_report(report)

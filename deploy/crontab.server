@@ -23,11 +23,16 @@
 #   - 日志由脚本自行写入 logs/<prefix>.log（含 _debug.log），cron 不重复重定向；
 #     stdout 丢弃，仅 stderr（启动失败/未捕获异常）追加到 logs/cron_error.log
 #   - flock 防止任务重入（节假日/周末趋势任务重叠等）
-#   - trend_analysis 每交易日 15:10 收盘后（卖出规则基于当日收盘K线）；脚本内部无交易日判断，
-#     cron 用 1-5 限定，法定节假日会多跑一次（产出空报告，无碍）；如需精确可留 1-5 即可
+#   - 趋势任务分两次：trend_sell 14:45 尾盘（卖出执行）、trend_analysis 15:10 盘后（买入分析）。
+#     两者用不同 flock 锁，互不阻塞；脚本内部无交易日判断，
+#     cron 用 1-5 限定，法定节假日会多跑一次（产出空报告/无持仓退出，无碍）
 # =============================================
 
-# ── 趋势跟踪分析：每交易日 15:10 收盘后（买入信号 + 持仓卖出信号，推送结果）──
+# ── 趋势卖出执行：每交易日 14:45 尾盘（检测卖出信号→自动下模拟仓市价单→出成交报告并推送）──
+#    须在 15:00 收盘前运行，收盘后模拟仓不可交易
+45 14 * * 1-5 cd /root/regime-trader && flock -n /tmp/trend-sell.lock /root/miniconda/envs/rt/bin/python trend_sell.py > /dev/null 2>> logs/cron_error.log
+
+# ── 趋势跟踪分析：每交易日 15:10 收盘后（买入信号 + 剔除/负面清单，推送结果）──
 10 15 * * 1-5 cd /root/regime-trader && flock -n /tmp/trend.lock /root/miniconda/envs/rt/bin/python trend_analysis.py > /dev/null 2>> logs/cron_error.log
 
 # ── ETF 周度观察 + 自动调仓：每周一 10:10（开盘后，妙想市价单可成交）──
